@@ -191,3 +191,102 @@ export function evaluateIfRange({ ifRange, etag, lastModified } = {}) {
     ? { satisfied: false, kind: 'date', reason: 'date-earlier' }
     : { satisfied: true, kind: 'date', reason: 'date-not-earlier' };
 }
+
+// RFC 9110 §13.1.2:
+//   If-None-Match = "*" / #entity-tag
+// The field value is either a lone "*" or a comma-separated list of
+// entity-tags; per §5.6.1.1 empty list elements are parsed and ignored.
+
+// Optional whitespace around a field value / list element (SP / HTAB only).
+const OWS_RE = /^[ \t]+|[ \t]+$/g;
+
+/**
+ * Parse an If-None-Match field value into `{ star, tags }`.
+ *
+ * Returns null when the value is malformed: anything that is neither a lone
+ * "*" nor a list of well-formed entity-tags (e.g. unquoted tokens, "*" mixed
+ * into a list, unbalanced quotes, or no validator at all).
+ */
+export function parseIfNoneMatch(value) {
+  if (typeof value !== 'string') return null;
+
+  const trimmed = value.replace(OWS_RE, '');
+  if (trimmed === '*') return { star: true, tags: [] };
+
+  const tags = [];
+  for (const element of trimmed.split(',')) {
+    const tag = element.replace(OWS_RE, '');
+    if (tag === '') continue; // empty list elements carry no meaning
+    if (!ENTITY_TAG_RE.test(tag)) return null;
+    tags.push(tag);
+  }
+  // A field that holds no validator at all ("", ",", " , ") is malformed.
+  return tags.length === 0 ? null : { star: false, tags };
+}
+
+/** The opaque-tag of an entity-tag: weakness is stripped, never the quotes. */
+function opaqueTag(entityTag) {
+  return entityTag.startsWith('W/') ? entityTag.slice(2) : entityTag;
+}
+
+/**
+ * Evaluate an If-None-Match header against the current ETag.
+ *
+ * Weak comparison (RFC 9110 §8.8.3.2): a listed tag matches when its
+ * opaque-tag is verbatim-equal to the current one, regardless of weakness
+ * on either side. "*" matches because the resource exists by definition
+ * (its size is part of the request).
+ *
+ * @returns {{malformed: boolean, matched: boolean, reason: string}}
+ *   reason is one of star-match / etag-weak-match / no-match /
+ *   resource-metadata-missing (no current etag to compare against).
+ */
+export function evaluateIfNoneMatch({ ifNoneMatch, etag } = {}) {
+  const parsed = parseIfNoneMatch(ifNoneMatch);
+  if (parsed === null) return { malformed: true, matched: false, reason: 'malformed' };
+
+  if (parsed.star) {
+    return { malformed: false, matched: true, reason: 'star-match' };
+  }
+  if (typeof etag !== 'string' || !ENTITY_TAG_RE.test(etag)) {
+    return { malformed: false, matched: false, reason: 'resource-metadata-missing' };
+  }
+
+  const current = opaqueTag(etag);
+  const hit = parsed.tags.some((tag) => opaqueTag(tag) === current);
+  return hit
+    ? { malformed: false, matched: true, reason: 'etag-weak-match' }
+    : { malformed: false, matched: false, reason: 'no-match' };
+}
+
+/**
+ * Evaluate an If-Modified-Since header against the current Last-Modified.
+ *
+ * An invalid request date makes the field inapplicable: the caller treats it
+ * as if the header had not been sent at all (RFC 9110 §13.1.4). Otherwise the
+ * resource is unmodified exactly when its Last-Modified instant is not later
+ * than the request date; a missing/unparseable current Last-Modified can
+ * never establish "unmodified".
+ *
+ * @returns {{applicable: boolean, notModified: boolean, reason: string}}
+ *   reason is one of date-not-later / date-later /
+ *   resource-metadata-missing; meaningless when applicable is false.
+ */
+export function evaluateIfModifiedSince({ ifModifiedSince, lastModified } = {}) {
+  // Both dates are interpreted relative to one reception instant so the
+  // parsed-millisecond comparison stays consistent across year boundaries.
+  const now = new Date();
+  const requestTime = parseHttpDate(ifModifiedSince, now);
+  if (requestTime === null) {
+    return { applicable: false, notModified: false, reason: 'invalid-date' };
+  }
+
+  const currentTime = typeof lastModified === 'string' ? parseHttpDate(lastModified, now) : null;
+  if (currentTime === null) {
+    return { applicable: true, notModified: false, reason: 'resource-metadata-missing' };
+  }
+
+  return currentTime <= requestTime
+    ? { applicable: true, notModified: true, reason: 'date-not-later' }
+    : { applicable: true, notModified: false, reason: 'date-later' };
+}

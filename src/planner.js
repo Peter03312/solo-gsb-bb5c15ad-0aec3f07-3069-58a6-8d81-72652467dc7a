@@ -126,9 +126,10 @@ export function planRanges(options) {
 /**
  * Build the 200 plan for a full representation: If-Range failed (or the
  * request would otherwise be downgraded), so Range is ignored and the whole
- * resource would be sent with Content-Length: size.
+ * resource would be sent with Content-Length: size. Also used for plain
+ * unconditional GET planning, in which case no condition block is attached.
  */
-function buildFullRepresentation({ size, contentType, etag, lastModified, condition }) {
+export function buildFullRepresentation({ size, contentType, etag, lastModified, condition }) {
   const responseHeaders = {
     'Accept-Ranges': 'bytes',
     'Content-Type': contentType,
@@ -152,12 +153,16 @@ function buildFullRepresentation({ size, contentType, etag, lastModified, condit
     },
     multipart: null,
     responseHeaders,
-    condition: {
-      header: 'If-Range',
-      validatorKind: condition.kind,
-      outcome: 'failed',
-      reason: condition.reason,
-    },
+    ...(condition
+      ? {
+          condition: {
+            header: 'If-Range',
+            validatorKind: condition.kind,
+            outcome: 'failed',
+            reason: condition.reason,
+          },
+        }
+      : {}),
   };
 }
 

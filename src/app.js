@@ -43,6 +43,7 @@ import {
   diffSnapshots,
   MAX_FRAGMENTS as MAX_DIFF_FRAGMENTS,
 } from './cache-diff.js';
+import { planGet } from './get-plan.js';
 import { ENTITY_TAG_RE, parseHttpDate } from './conditional.js';
 
 const MEDIA_TYPE_RE =
@@ -362,6 +363,41 @@ export function buildApp(config = {}) {
     return reply.status(result.statusCode).send(result);
   });
 
+  // Conditional GET planning: POST /get-plan plans the response to a GET
+  // request for an existing resource. Range / If-Range / If-None-Match /
+  // If-Modified-Since arrive as real request headers exactly as an origin
+  // would receive them; Range is optional here (a plain GET plans the full
+  // representation). Resource metadata rides in the JSON body.
+  app.post('/get-plan', { schema: { body: planBodySchema } }, async (request, reply) => {
+    const headerError = checkGetPlanHeaders(request);
+    if (headerError) return reply.status(400).send(headerError);
+
+    if (request.body.contentType !== undefined && !MEDIA_TYPE_RE.test(request.body.contentType)) {
+      return reply.status(400).send(invalidContentType());
+    }
+
+    const metadataError = checkMetadata({
+      etag: request.body.etag,
+      lastModified: request.body.lastModified,
+    });
+    if (metadataError) return reply.status(400).send(metadataError);
+
+    const result = planGet({
+      size: request.body.size,
+      contentType: request.body.contentType,
+      etag: request.body.etag,
+      lastModified: request.body.lastModified,
+      ifNoneMatch: request.headers['if-none-match'],
+      ifModifiedSince: request.headers['if-modified-since'],
+      rangeHeader: request.headers.range,
+      ifRange: request.headers['if-range'],
+      maxSegments,
+      transferSizeRatio,
+    });
+
+    return reply.status(getPlanTransportStatus(result)).send(result);
+  });
+
   // Resumable-download gap planning: POST /resume-plan with the persisted
   // intervals in the JSON body; no Range header involved.
   app.post(
@@ -586,7 +622,74 @@ export function buildApp(config = {}) {
     return reply.status(result.statusCode).send(result);
   });
 
+  // GET variant of /get-plan so the conditional-GET planner is probeable
+  // with a bare curl:
+  //   curl 'http://localhost:3000/get-plan?size=1000&etag="v1"' -H 'If-None-Match: "v1"'
+  app.get('/get-plan', async (request, reply) => {
+    const { size: sizeRaw, contentType, etag, lastModified } = request.query;
+
+    const size = Number(sizeRaw);
+    if (sizeRaw === undefined || !Number.isSafeInteger(size) || size < 0 || String(size) !== String(sizeRaw).trim()) {
+      return reply.status(400).send({
+        statusCode: 400,
+        code: 'INVALID_SIZE',
+        error: 'Bad Request',
+        message: 'query parameter size is required and must be a non-negative integer',
+      });
+    }
+    if (contentType !== undefined && !MEDIA_TYPE_RE.test(contentType)) {
+      return reply.status(400).send(invalidContentType());
+    }
+
+    // Repeated query params arrive as arrays.
+    const duplicateCodes = {
+      etag: 'DUPLICATE_ETAG_PARAMETER',
+      lastModified: 'DUPLICATE_LAST_MODIFIED_PARAMETER',
+    };
+    for (const [name, value] of [['etag', etag], ['lastModified', lastModified]]) {
+      if (Array.isArray(value)) {
+        return reply.status(400).send({
+          statusCode: 400,
+          code: duplicateCodes[name],
+          error: 'Bad Request',
+          message: `exactly one ${name} query parameter is allowed`,
+        });
+      }
+    }
+
+    const metadataError = checkMetadata({ etag, lastModified });
+    if (metadataError) return reply.status(400).send(metadataError);
+
+    const headerError = checkGetPlanHeaders(request);
+    if (headerError) return reply.status(400).send(headerError);
+
+    const result = planGet({
+      size,
+      contentType,
+      etag,
+      lastModified,
+      ifNoneMatch: request.headers['if-none-match'],
+      ifModifiedSince: request.headers['if-modified-since'],
+      rangeHeader: request.headers.range,
+      ifRange: request.headers['if-range'],
+      maxSegments,
+      transferSizeRatio,
+    });
+
+    return reply.status(getPlanTransportStatus(result)).send(result);
+  });
+
   return app;
+}
+
+/**
+ * The API normally mirrors the planned status on the wire. A 304 plan is the
+ * one exception: HTTP forbids a message body on 304 responses, and the JSON
+ * plan *is* the body — so a 304 plan is transported as a 200 and the planned
+ * status travels in the body's `statusCode` field.
+ */
+function getPlanTransportStatus(result) {
+  return result.statusCode === 304 ? 200 : result.statusCode;
 }
 
 function invalidContentType() {
@@ -633,7 +736,7 @@ function checkMetadata({ etag, lastModified }) {
   return null;
 }
 
-function checkRangeHeader(request) {
+function checkRangeHeader(request, { required = true } = {}) {
   // Reject duplicate Range headers explicitly; Node would otherwise silently
   // join them with a comma and produce a confusing parse error.
   let occurrences = 0;
@@ -651,6 +754,7 @@ function checkRangeHeader(request) {
 
   const rangeHeader = request.headers.range;
   if (rangeHeader === undefined) {
+    if (!required) return null;
     return {
       statusCode: 400,
       code: 'MISSING_RANGE',
@@ -667,6 +771,80 @@ function checkRangeHeader(request) {
     };
   }
   return null;
+}
+
+/**
+ * Validate a single-valued conditional header field (If-None-Match,
+ * If-Modified-Since): reject duplicates, CR/LF and overlong values. Field
+ * value syntax is evaluated later by the planner.
+ */
+function checkConditionalHeader(request, { field, displayName, duplicateCode, invalidCode }) {
+  let occurrences = 0;
+  for (let i = 0; i < request.raw.rawHeaders.length; i += 2) {
+    if (request.raw.rawHeaders[i].toLowerCase() === field) occurrences += 1;
+  }
+  if (occurrences > 1) {
+    return {
+      statusCode: 400,
+      code: duplicateCode,
+      error: 'Bad Request',
+      message: `exactly one ${displayName} header is allowed`,
+    };
+  }
+
+  const value = request.headers[field];
+  if (value === undefined) return null;
+
+  // CR/LF must never reach a value even though the HTTP parser forbids them
+  // in folded header content; reject unconditionally to rule out injection.
+  if (/[\r\n]/.test(value)) {
+    return {
+      statusCode: 400,
+      code: invalidCode,
+      error: 'Bad Request',
+      message: `${displayName} must not contain CR or LF characters`,
+    };
+  }
+  if (value.length > MAX_HEADER_LENGTH) {
+    return {
+      statusCode: 400,
+      code: invalidCode,
+      error: 'Bad Request',
+      message: `${displayName} header exceeds the ${MAX_HEADER_LENGTH}-byte limit`,
+    };
+  }
+  return null;
+}
+
+function checkIfNoneMatchHeader(request) {
+  return checkConditionalHeader(request, {
+    field: 'if-none-match',
+    displayName: 'If-None-Match',
+    duplicateCode: 'DUPLICATE_IF_NONE_MATCH_HEADER',
+    invalidCode: 'INVALID_IF_NONE_MATCH',
+  });
+}
+
+function checkIfModifiedSinceHeader(request) {
+  return checkConditionalHeader(request, {
+    field: 'if-modified-since',
+    displayName: 'If-Modified-Since',
+    duplicateCode: 'DUPLICATE_IF_MODIFIED_SINCE_HEADER',
+    invalidCode: 'INVALID_IF_MODIFIED_SINCE',
+  });
+}
+
+/**
+ * Run every header check a conditional-GET plan needs: Range (optional
+ * here), If-Range, If-None-Match and If-Modified-Since.
+ */
+function checkGetPlanHeaders(request) {
+  return (
+    checkRangeHeader(request, { required: false }) ??
+    checkIfRangeHeader(request) ??
+    checkIfNoneMatchHeader(request) ??
+    checkIfModifiedSinceHeader(request)
+  );
 }
 
 function checkIfRangeHeader(request) {
