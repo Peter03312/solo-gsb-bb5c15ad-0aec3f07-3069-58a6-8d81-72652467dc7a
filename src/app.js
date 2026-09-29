@@ -2,6 +2,7 @@ import Fastify from 'fastify';
 import Ajv from 'ajv';
 import {
   planRanges,
+  planFullRepresentation,
   DEFAULT_MAX_SEGMENTS,
   DEFAULT_TRANSFER_SIZE_RATIO,
 } from './planner.js';
@@ -44,6 +45,10 @@ import {
   MAX_FRAGMENTS as MAX_DIFF_FRAGMENTS,
 } from './cache-diff.js';
 import { ENTITY_TAG_RE, parseHttpDate } from './conditional.js';
+import {
+  evaluateConditionalGet,
+  buildNotModifiedPlan,
+} from './conditional-get.js';
 
 const MEDIA_TYPE_RE =
   /^[A-Za-z0-9][A-Za-z0-9!#$%&'*+.^_`|~-]*\/[A-Za-z0-9][A-Za-z0-9!#$%&'*+.^_`|~-]*(?:\s*;\s*[A-Za-z0-9!#$%&'*+.^_`|~-]+=(?:[A-Za-z0-9!#$%&'*+.^_`|~-]+|"(?:[^"\\\r\n]|\\.)*"))*$/;
@@ -529,6 +534,102 @@ export function buildApp(config = {}) {
     },
   );
 
+  // Conditional GET planning for an existing resource: POST /get-plan with
+  // the resource metadata in the JSON body (same shape as POST /plan) and
+  // Range / If-Range / If-None-Match / If-Modified-Since carried as real
+  // request headers.
+  app.post('/get-plan', { schema: { body: planBodySchema } }, async (request, reply) => {
+    const contentType = request.body.contentType;
+    if (contentType !== undefined && !MEDIA_TYPE_RE.test(contentType)) {
+      return reply.status(400).send(invalidContentType());
+    }
+
+    const metadataError = checkMetadata({
+      etag: request.body.etag,
+      lastModified: request.body.lastModified,
+    });
+    if (metadataError) return reply.status(400).send(metadataError);
+
+    const conditionError = checkConditionalGetHeaders(request);
+    if (conditionError) return reply.status(400).send(conditionError);
+
+    // Range is optional on a GET; reject duplicates/CR-LF up front but leave
+    // the (optional) syntax check for the non-304 path.
+    const rangeStructuralError = checkRangeHeaderOptional(request);
+    if (rangeStructuralError) return reply.status(400).send(rangeStructuralError);
+
+    const ifRangeError = checkIfRangeHeader(request);
+    if (ifRangeError) return reply.status(400).send(ifRangeError);
+
+    return sendConditionalGetPlan(reply, {
+      size: request.body.size,
+      contentType,
+      etag: request.body.etag,
+      lastModified: request.body.lastModified,
+      headers: request.headers,
+      maxSegments,
+      transferSizeRatio,
+    });
+  });
+
+  // GET convenience form, probeable with a bare curl:
+  //   curl 'http://localhost:3000/get-plan?size=1000&etag=...' \
+  //        -H 'If-None-Match: "v1"'
+  app.get('/get-plan', async (request, reply) => {
+    const { size: sizeRaw, contentType, etag, lastModified } = request.query;
+
+    const size = Number(sizeRaw);
+    if (sizeRaw === undefined || !Number.isSafeInteger(size) || size < 0 || String(size) !== String(sizeRaw).trim()) {
+      return reply.status(400).send({
+        statusCode: 400,
+        code: 'INVALID_SIZE',
+        error: 'Bad Request',
+        message: 'query parameter size is required and must be a non-negative integer',
+      });
+    }
+    if (contentType !== undefined && !MEDIA_TYPE_RE.test(contentType)) {
+      return reply.status(400).send(invalidContentType());
+    }
+
+    // Repeated query params arrive as arrays.
+    const duplicateCodes = {
+      etag: 'DUPLICATE_ETAG_PARAMETER',
+      lastModified: 'DUPLICATE_LAST_MODIFIED_PARAMETER',
+    };
+    for (const [name, value] of [['etag', etag], ['lastModified', lastModified]]) {
+      if (Array.isArray(value)) {
+        return reply.status(400).send({
+          statusCode: 400,
+          code: duplicateCodes[name],
+          error: 'Bad Request',
+          message: `exactly one ${name} query parameter is allowed`,
+        });
+      }
+    }
+
+    const metadataError = checkMetadata({ etag, lastModified });
+    if (metadataError) return reply.status(400).send(metadataError);
+
+    const conditionError = checkConditionalGetHeaders(request);
+    if (conditionError) return reply.status(400).send(conditionError);
+
+    const rangeStructuralError = checkRangeHeaderOptional(request);
+    if (rangeStructuralError) return reply.status(400).send(rangeStructuralError);
+
+    const ifRangeError = checkIfRangeHeader(request);
+    if (ifRangeError) return reply.status(400).send(ifRangeError);
+
+    return sendConditionalGetPlan(reply, {
+      size,
+      contentType,
+      etag,
+      lastModified,
+      headers: request.headers,
+      maxSegments,
+      transferSizeRatio,
+    });
+  });
+
   // Convenience endpoint so the API is probeable with a bare curl:
   //   curl 'http://localhost:3000/plan?size=1000' -H 'Range: bytes=0-99'
   app.get('/plan', async (request, reply) => {
@@ -587,6 +688,74 @@ export function buildApp(config = {}) {
   });
 
   return app;
+}
+
+/**
+ * Shared conditional-GET planning used by POST/GET /get-plan.
+ *
+ * Order (all structural validation has already happened at the edge):
+ *   1. evaluate If-None-Match / If-Modified-Since; a match short-circuits to
+ *      the 304 plan and Range is never parsed;
+ *   2. otherwise honour Range+If-Range (400/416/422 possible) or plan the
+ *      full 200 representation.
+ *
+ * A real 304 cannot carry a body on the wire (Node suppresses it and HTTP
+ * clients discard it); the 304 JSON is therefore sent over HTTP 200 with an
+ * `X-Planned-Status: 304` response header.
+ */
+async function sendConditionalGetPlan(
+  reply,
+  { size, contentType, etag, lastModified, headers, maxSegments, transferSizeRatio },
+) {
+  const evaluation = evaluateConditionalGet({
+    ifNoneMatch: headers['if-none-match'],
+    ifModifiedSince: headers['if-modified-since'],
+    etag,
+    lastModified,
+  });
+
+  // A malformed If-None-Match field is a request error (400), even though a
+  // Range header is also present.
+  if (evaluation.fieldError) {
+    return reply.status(400).send({
+      statusCode: 400,
+      code: evaluation.fieldError.code,
+      error: 'Bad Request',
+      message: evaluation.fieldError.message,
+    });
+  }
+
+  if (evaluation.notModified) {
+    const plan = buildNotModifiedPlan({ etag, lastModified });
+    plan.precondition = evaluation.precondition;
+    reply.header('X-Planned-Status', '304');
+    return reply.status(200).send(plan);
+  }
+
+  const rangeHeader = headers.range;
+  let result;
+  if (rangeHeader !== undefined) {
+    result = planRanges({
+      size,
+      contentType,
+      rangeHeader,
+      maxSegments,
+      transferSizeRatio,
+      etag,
+      lastModified,
+      ifRange: headers['if-range'],
+    });
+  } else {
+    result = planFullRepresentation({ size, contentType, etag, lastModified });
+  }
+
+  if (evaluation.precondition) {
+    // Range/416/422 results also carry the validator-evaluation record so the
+    // decision stays self-explanatory.
+    result = { ...result, precondition: evaluation.precondition };
+  }
+
+  return reply.status(result.statusCode).send(result);
 }
 
 function invalidContentType() {
@@ -666,6 +835,125 @@ function checkRangeHeader(request) {
       message: `Range header exceeds the ${MAX_HEADER_LENGTH}-byte limit`,
     };
   }
+  return null;
+}
+
+/**
+ * Structural Range checks for endpoints where Range is optional
+ * (/get-plan): reject duplicate lines and oversized/CR-LF values, but allow
+ * the header to be absent. A syntactically bad value is only parsed (and
+ * answered with 400) on the non-304 path — a conditional 304 must never
+ * depend on Range.
+ */
+function checkRangeHeaderOptional(request) {
+  let occurrences = 0;
+  for (let i = 0; i < request.raw.rawHeaders.length; i += 2) {
+    if (request.raw.rawHeaders[i].toLowerCase() === 'range') occurrences += 1;
+  }
+  if (occurrences > 1) {
+    return {
+      statusCode: 400,
+      code: 'DUPLICATE_RANGE_HEADER',
+      error: 'Bad Request',
+      message: 'exactly one Range header is allowed',
+    };
+  }
+
+  const rangeHeader = request.headers.range;
+  if (rangeHeader === undefined) return null;
+  if (/[\r\n]/.test(rangeHeader)) {
+    return {
+      statusCode: 400,
+      code: 'MALFORMED_RANGE',
+      error: 'Bad Request',
+      message: 'Range must not contain CR or LF characters',
+    };
+  }
+  if (rangeHeader.length > MAX_HEADER_LENGTH) {
+    return {
+      statusCode: 400,
+      code: 'MALFORMED_RANGE',
+      error: 'Bad Request',
+      message: `Range header exceeds the ${MAX_HEADER_LENGTH}-byte limit`,
+    };
+  }
+  return null;
+}
+
+/**
+ * Validate the conditional fields of /get-plan: If-None-Match and
+ * If-Modified-Since each appear at most once and never carry CR/LF or exceed
+ * the header-size ceiling. A syntactically malformed If-None-Match is a 400
+ * (RFC 9110 defines the field as a list); an invalid If-Modified-Since
+ * *date* is not rejected here — evaluation later treats it as absent.
+ */
+function checkConditionalGetHeaders(request) {
+  const counts = {
+    'if-none-match': 0,
+    'if-modified-since': 0,
+  };
+  for (let i = 0; i < request.raw.rawHeaders.length; i += 2) {
+    const name = request.raw.rawHeaders[i].toLowerCase();
+    if (name in counts) counts[name] += 1;
+  }
+
+  if (counts['if-none-match'] > 1) {
+    return {
+      statusCode: 400,
+      code: 'DUPLICATE_IF_NONE_MATCH_HEADER',
+      error: 'Bad Request',
+      message: 'exactly one If-None-Match header is allowed',
+    };
+  }
+  if (counts['if-modified-since'] > 1) {
+    return {
+      statusCode: 400,
+      code: 'DUPLICATE_IF_MODIFIED_SINCE_HEADER',
+      error: 'Bad Request',
+      message: 'exactly one If-Modified-Since header is allowed',
+    };
+  }
+
+  const ifNoneMatch = request.headers['if-none-match'];
+  if (ifNoneMatch !== undefined) {
+    if (/[\r\n]/.test(ifNoneMatch)) {
+      return {
+        statusCode: 400,
+        code: 'MALFORMED_IF_NONE_MATCH',
+        error: 'Bad Request',
+        message: 'If-None-Match must not contain CR or LF characters',
+      };
+    }
+    if (ifNoneMatch.length > MAX_HEADER_LENGTH) {
+      return {
+        statusCode: 400,
+        code: 'MALFORMED_IF_NONE_MATCH',
+        error: 'Bad Request',
+        message: `If-None-Match header exceeds the ${MAX_HEADER_LENGTH}-byte limit`,
+      };
+    }
+  }
+
+  const ifModifiedSince = request.headers['if-modified-since'];
+  if (ifModifiedSince !== undefined) {
+    if (/[\r\n]/.test(ifModifiedSince)) {
+      return {
+        statusCode: 400,
+        code: 'INVALID_IF_MODIFIED_SINCE',
+        error: 'Bad Request',
+        message: 'If-Modified-Since must not contain CR or LF characters',
+      };
+    }
+    if (ifModifiedSince.length > MAX_HEADER_LENGTH) {
+      return {
+        statusCode: 400,
+        code: 'INVALID_IF_MODIFIED_SINCE',
+        error: 'Bad Request',
+        message: `If-Modified-Since header exceeds the ${MAX_HEADER_LENGTH}-byte limit`,
+      };
+    }
+  }
+
   return null;
 }
 

@@ -124,9 +124,32 @@ export function planRanges(options) {
 }
 
 /**
- * Build the 200 plan for a full representation: If-Range failed (or the
- * request would otherwise be downgraded), so Range is ignored and the whole
+ * Build the 200 plan for a full representation: If-Range failed (or an
+ * ordinary GET without Range), so Range is ignored / absent and the whole
  * resource would be sent with Content-Length: size.
+ */
+export function planFullRepresentation({ size, contentType = DEFAULT_CONTENT_TYPE, etag, lastModified } = {}) {
+  if (!Number.isSafeInteger(size) || size < 0) {
+    return fail(400, 'INVALID_SIZE', 'size must be a non-negative safe integer');
+  }
+  if (typeof contentType !== 'string' || /[\r\n]/.test(contentType) || contentType.length === 0) {
+    return fail(400, 'INVALID_CONTENT_TYPE', 'contentType must be a single header-safe string');
+  }
+  if (etag !== undefined && (typeof etag !== 'string' || /[\r\n]/.test(etag) || etag.length === 0)) {
+    return fail(400, 'INVALID_ETAG', 'etag must be a single header-safe entity-tag string');
+  }
+  if (
+    lastModified !== undefined &&
+    (typeof lastModified !== 'string' || /[\r\n]/.test(lastModified) || lastModified.length === 0)
+  ) {
+    return fail(400, 'INVALID_LAST_MODIFIED', 'lastModified must be a single header-safe HTTP-date string');
+  }
+  return buildFullRepresentation({ size, contentType, etag, lastModified, condition: null });
+}
+
+/**
+ * Internal builder: the If-Range failure path attaches its `condition` block;
+ * the plain-GET path passes null and gets no such block.
  */
 function buildFullRepresentation({ size, contentType, etag, lastModified, condition }) {
   const responseHeaders = {
@@ -137,7 +160,7 @@ function buildFullRepresentation({ size, contentType, etag, lastModified, condit
   if (etag !== undefined) responseHeaders.ETag = etag;
   if (lastModified !== undefined) responseHeaders['Last-Modified'] = lastModified;
 
-  return {
+  const plan = {
     statusCode: 200,
     decision: 'full',
     resource: buildResource({ size, contentType, etag, lastModified }),
@@ -152,13 +175,16 @@ function buildFullRepresentation({ size, contentType, etag, lastModified, condit
     },
     multipart: null,
     responseHeaders,
-    condition: {
+  };
+  if (condition) {
+    plan.condition = {
       header: 'If-Range',
       validatorKind: condition.kind,
       outcome: 'failed',
       reason: condition.reason,
-    },
-  };
+    };
+  }
+  return plan;
 }
 
 /**

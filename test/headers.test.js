@@ -98,3 +98,63 @@ test('bare LF in the If-Range value is rejected, never reaching the planner', as
   const raw = await rawRequestBytes(head, body);
   assert.match(raw.split('\r\n')[0], /^HTTP\/1\.1 400/);
 });
+
+// ---------- /get-plan conditional fields ----------
+
+function postGetPlan(lines, bodyObj) {
+  const body = JSON.stringify(bodyObj);
+  return rawRequest(
+    [
+      'POST /get-plan HTTP/1.1',
+      'Host: 127.0.0.1',
+      'Connection: close',
+      'Content-Type: application/json',
+      `Content-Length: ${Buffer.byteLength(body)}`,
+      ...lines,
+    ],
+    body,
+  );
+}
+
+test('duplicate If-None-Match headers are rejected with 400 DUPLICATE_IF_NONE_MATCH_HEADER', async () => {
+  const raw = await postGetPlan(
+    ['If-None-Match: "v1"', 'If-None-Match: "v1"'],
+    { size: 1000, etag: '"v1"' },
+  );
+  assert.match(raw.split('\r\n')[0], /^HTTP\/1\.1 400/);
+  assert.match(raw, /DUPLICATE_IF_NONE_MATCH_HEADER/);
+});
+
+test('duplicate If-Modified-Since headers are rejected with 400', async () => {
+  const raw = await postGetPlan(
+    [
+      'If-Modified-Since: Wed, 21 Oct 2015 07:28:00 GMT',
+      'If-Modified-Since: Thu, 22 Oct 2015 07:28:00 GMT',
+    ],
+    { size: 1000, lastModified: 'Wed, 21 Oct 2015 07:28:00 GMT' },
+  );
+  assert.match(raw.split('\r\n')[0], /^HTTP\/1\.1 400/);
+  assert.match(raw, /DUPLICATE_IF_MODIFIED_SINCE_HEADER/);
+});
+
+test('/get-plan rejects duplicate Range headers even on a matching validator', async () => {
+  const raw = await postGetPlan(
+    ['If-None-Match: "v1"', 'Range: bytes=0-9', 'Range: bytes=10-19'],
+    { size: 1000, etag: '"v1"' },
+  );
+  assert.match(raw.split('\r\n')[0], /^HTTP\/1\.1 400/);
+  assert.match(raw, /DUPLICATE_RANGE_HEADER/);
+});
+
+test('/get-plan 304 plan is delivered over HTTP 200 with X-Planned-Status and a JSON body', async () => {
+  const raw = await postGetPlan(['If-None-Match: "v1"'], {
+    size: 1000,
+    etag: '"v1"',
+    lastModified: 'Wed, 21 Oct 2015 07:28:00 GMT',
+  });
+  assert.match(raw.split('\r\n')[0], /^HTTP\/1\.1 200/);
+  assert.match(raw, /x-planned-status: 304/i);
+  const payload = JSON.parse(raw.slice(raw.indexOf('\r\n\r\n') + 4));
+  assert.equal(payload.statusCode, 304);
+  assert.equal(payload.decision, 'not-modified');
+});

@@ -10,6 +10,14 @@ API，遵循 [RFC 9110 §14](https://www.rfc-editor.org/rfc/rfc9110.html#section
 另提供 `POST /resume-plan` 断点续传缺口规划接口：上报已持久化的字节区间，
 返回还需请求的 Range 分片清单（见下文）。
 
+`POST/GET /get-plan` 面向**已有资源的条件 GET**（RFC 9110 §13.1）：以真实
+请求头携带 `Range`、`If-Range`、`If-None-Match`、`If-Modified-Since`，资源
+大小与当前 `ETag`/`Last-Modified` 放在 JSON 体（GET 版用查询参数）；服务先按
+弱比较评估 `If-None-Match`（支持标签列表与 `*`，该字段一旦存在即忽略
+If-Modified-Since），再评估 If-Modified-Since，命中则规划 `304`（仅保留现有
+验证器头、不解析 Range、无响应体长度与分段），未命中时有 Range 沿用现有
+Range/If-Range 规则、无 Range 规划完整 `200`（见下文）。
+
 `POST /multipart-check` 则用于**核验**真实的 `multipart/byteranges` 响应
 报文：传入资源大小、期望区间与原始报文，返回实收、缺失、预期外的字节区间。
 
@@ -166,6 +174,135 @@ curl -X POST http://localhost:3000/plan \
 # 旧式日期同样可作为资源元数据（GET 版，注意空格需要 %20 编码）
 curl 'http://localhost:3000/plan?size=10000&lastModified=Wednesday,%2021-Oct-15%2007:28:00%20GMT' \
   -H 'Range: bytes=0-99'
+```
+
+### `POST /get-plan`（已有资源的条件 GET 规划）
+
+模拟源站对一份**已存在资源**的 `GET` 请求做条件请求评估与范围规划。资源信息
+放在 JSON 体（字段与 `POST /plan` 完全相同：`size` 必填，`contentType`、
+`etag`、`lastModified` 可选），四个请求相关字段全部以**真实 HTTP 请求头**
+携带：`Range`、`If-Range`、`If-None-Match`、`If-Modified-Since`。另有等价的
+`GET /get-plan?size=…&contentType=…&etag=…&lastModified=…` 便于直接 curl。
+
+评估顺序与语义（RFC 9110 §13.1.1 / §13.1.3）：
+
+1. **先评估 `If-None-Match`**：字段值为 `*`（资源必然存在，恒命中）或逗号
+   分隔的实体标签列表，列表中任一标签与当前 `etag` 按**弱比较**
+   （§8.8.3.2：去掉双方大小写敏感的 `W/` 前缀后逐字比较）相等即为命中。
+   **该字段一旦存在（即使内容非法），就完全忽略 `If-Modified-Since`。**
+2. **没有 If-None-Match 时才评估 `If-Modified-Since`**：仅当请求日期是合法
+   HTTP-date **且**资源当前 `Last-Modified` 也有效时才比较——资源时刻**不晚于**
+   请求日期（相等也算未修改，即客户端原样回显 Last-Modified 的常见情形）即
+   未修改。请求日期非法时**视同未提供该头**（继续正常处理，不报错）。
+3. **命中（未修改）→ 规划 `304`**：`decision: "not-modified"`，`responseHeaders`
+   **只保留现有的验证器头**（提供了哪个就回显哪个：`ETag` / `Last-Modified`），
+   **不解析 `Range`**（所以即使 Range 语法错误或不可满足也仍是 304），
+   `bytes`/`segments`/`segmentsCount`/`multipart` 均为 `null`，没有
+   `Content-Length` / `Content-Range`。
+4. **未命中**：有 `Range` 时完全沿用 `/plan` 的现有范围与 `If-Range` 规则
+   （206/416/422、If-Range 失败降级 200）；无 `Range` 时规划完整 `200`
+   （`decision: "full"`，`Content-Length=size`）。
+
+> **304 的传输封装**：RFC 9110 规定 304 响应不得带消息体，Node 的 HTTP 栈
+> 也会在底层直接丢弃 304 上写入的任何字节（curl/fetch 同样不读取）。因此
+> 304 规划通过 **HTTP 200 + 响应头 `X-Planned-Status: 304`** 传输，JSON 体内
+> 的 `statusCode` 仍是 `304`；客户端以该头（或 JSON 的 `statusCode`）识别
+> 规划状态。其余规划（200/206/416/422/400）的实际 HTTP 状态码与规划状态码
+> 一致。
+
+每次有效评估都会在结果中给出 `precondition` 块：
+
+| 头 | `outcome` | `reason` |
+| --- | --- | --- |
+| If-None-Match | `matched` | `etag-match` / `wildcard` |
+| If-None-Match | `not-matched` | `etag-mismatch` / `resource-metadata-missing` |
+| If-Modified-Since | `matched` | `not-modified-since` |
+| If-Modified-Since | `not-matched` | `modified-after` |
+| If-Modified-Since | `not-applicable` | `resource-metadata-missing` |
+
+非法的 If-Modified-Since 日期视同未提供，不带 `precondition` 块。带 `Range`
+且 If-Range 也参与时，结果中另保留 `/plan` 的 `condition` 块说明 If-Range
+判定，二者互不覆盖。
+
+错误（均为 `400`）：
+
+- `MALFORMED_IF_NONE_MATCH`：If-None-Match 不是 `*` 也不是合法实体标签列表
+  （裸 token、未闭合引号、空列表项、`*` 与标签混用等）；
+- `DUPLICATE_IF_NONE_MATCH_HEADER` / `DUPLICATE_IF_MODIFIED_SINCE_HEADER`：
+  对应条件头重复出现；
+- `INVALID_ETAG` / `INVALID_LAST_MODIFIED`：资源元数据非法（即使 `*` 本会
+  命中 304，元数据非法仍先返回 400）；
+- `DUPLICATE_RANGE_HEADER` / `MALFORMED_RANGE` /
+  `DUPLICATE_IF_RANGE_HEADER` / `INVALID_IF_RANGE`：与 `/plan` 相同的结构
+  校验（重复 Range 在 304 短路之前即被拒绝；Range 语法错误只在未命中、需要
+  解析 Range 的路径上产生 400）。
+
+示例：
+
+```bash
+# If-None-Match 命中当前 ETag -> X-Planned-Status: 304，只回验证器头
+curl -i -X POST http://localhost:3000/get-plan \
+  -H 'Content-Type: application/json' \
+  -H 'If-None-Match: "v1-abc"' \
+  -d '{"size":10000,"etag":"\"v1-abc\"","lastModified":"Wed, 21 Oct 2015 07:28:00 GMT"}'
+# HTTP/1.1 200 OK
+# x-planned-status: 304
+# {"statusCode":304,"decision":"not-modified",...,"responseHeaders":{
+#    "ETag":"\"v1-abc\"","Last-Modified":"Wed, 21 Oct 2015 07:28:00 GMT"},
+#  "precondition":{"header":"If-None-Match","outcome":"matched","reason":"etag-match"}}
+
+# 标签列表 + 弱比较：W/"v1" 与强 ETag "v1" 弱相等 -> 304
+curl -s -X POST http://localhost:3000/get-plan \
+  -H 'Content-Type: application/json' \
+  -H 'If-None-Match: "old", W/"v1-abc", "other"' \
+  -d '{"size":10000,"etag":"\"v1-abc\""}'
+
+# 通配符 *：资源存在即 304（无需任何元数据）
+curl -s -X POST http://localhost:3000/get-plan \
+  -H 'Content-Type: application/json' -H 'If-None-Match: *' -d '{"size":10000}'
+
+# 未命中 + Range -> 206（沿用 /plan 全部规则）
+curl -s -X POST http://localhost:3000/get-plan \
+  -H 'Content-Type: application/json' \
+  -H 'If-None-Match: "stale"' -H 'Range: bytes=0-99' \
+  -d '{"size":10000,"etag":"\"v1-abc\""}'
+
+# 命中 304 时 Range 根本不解析：即使 Range 不可满足也是 304
+curl -s -X POST http://localhost:3000/get-plan \
+  -H 'Content-Type: application/json' \
+  -H 'If-None-Match: "v1-abc"' -H 'Range: bytes=999999-' \
+  -d '{"size":10000,"etag":"\"v1-abc\""}'
+
+# 无 If-None-Match，If-Modified-Since 不早于 Last-Modified -> 304
+curl -s -X POST http://localhost:3000/get-plan \
+  -H 'Content-Type: application/json' \
+  -H 'If-Modified-Since: Thu, 22 Oct 2015 07:28:00 GMT' \
+  -d '{"size":10000,"lastModified":"Wed, 21 Oct 2015 07:28:00 GMT"}'
+
+# If-None-Match 一旦存在即忽略 If-Modified-Since（这里 INM 未命中、IMS 本会命中）
+# -> 206，而不是 304
+curl -s -X POST http://localhost:3000/get-plan \
+  -H 'Content-Type: application/json' \
+  -H 'If-None-Match: "other"' \
+  -H 'If-Modified-Since: Wed, 21 Oct 2015 07:28:00 GMT' \
+  -H 'Range: bytes=0-99' \
+  -d '{"size":10000,"etag":"\"v1-abc\"","lastModified":"Wed, 21 Oct 2015 07:28:00 GMT"}'
+
+# 非法 If-Modified-Since 视同未提供；无 Range -> 完整 200
+curl -s -X POST http://localhost:3000/get-plan \
+  -H 'Content-Type: application/json' -H 'If-Modified-Since: garbage' \
+  -d '{"size":10000,"lastModified":"Wed, 21 Oct 2015 07:28:00 GMT"}'
+
+# 无条件头、无 Range -> 完整 200 规划
+curl -s -X POST http://localhost:3000/get-plan \
+  -H 'Content-Type: application/json' -d '{"size":10000,"contentType":"video/mp4"}'
+
+# 等价 GET
+curl -s 'http://localhost:3000/get-plan?size=10000&etag=%22v1-abc%22' -H 'If-None-Match: "v1-abc"'
+
+# 格式错误的 If-None-Match -> 400
+curl -i -X POST http://localhost:3000/get-plan \
+  -H 'Content-Type: application/json' -H 'If-None-Match: junk' -d '{"size":10000}'
 ```
 
 ### `POST /resume-plan`（断点续传缺口规划）
@@ -898,6 +1035,8 @@ curl -s -i -X POST http://localhost:3000/cache-snapshot-diff \
 - `"partial"` —— 执行 Range 规划：`206`（含 `416`/`422` 这类仍针对分片
   请求的结果）。
 - `"full"` —— 忽略 Range、返回完整表示规划：仅 `200`。
+- `"not-modified"` —— 条件 GET 命中：仅 `/get-plan` 返回，规划状态码
+  `304`（经 HTTP 200 + `X-Planned-Status: 304` 传输），无响应体长度与分段。
 
 | 情况 | 状态码 | `decision` | 说明 |
 | --- | --- | --- | --- |
@@ -908,6 +1047,7 @@ curl -s -i -X POST http://localhost:3000/cache-snapshot-diff \
 | `Range` 语法错误 / 非 byte 单位 / 缺失 | `400` | — | 头本身无效，区别于“语法合法但无法满足” |
 | 合并后段数 > 16 | `422` | `partial` | `code: TOO_MANY_SEGMENTS` |
 | 计划传输字节 > 资源大小 × 2 | `422` | `partial` | `code: TRANSFER_LIMIT_EXCEEDED`，封装字节（边界+段头+收尾）也计入 |
+| 条件 GET 命中（仅 `/get-plan`） | `304` | `not-modified` | 经 **HTTP 200 + `X-Planned-Status: 304`** 传输；`responseHeaders` 仅含现有 `ETag`/`Last-Modified`，`bytes`/`segments`/`multipart` 为 `null`；Range 不解析 |
 
 请求带 `If-Range` 时，结果中还有 `condition` 块说明判定依据：
 
@@ -942,6 +1082,13 @@ curl -s -i -X POST http://localhost:3000/cache-snapshot-diff \
   接收时 UTC 年份解释，超过未来 50 年回拨 100 年），并把双方统一解析成
   时刻后比较：日期 **不早于** `lastModified` 才通过。任何不通过的情形都
   降级为 `200 decision:"full"`；未提供 `If-Range` 时行为与原先完全一致。
+- **条件 GET（§13.1，仅 `/get-plan`）**：`If-None-Match` 为 `*` 或
+  实体标签列表，按**弱比较**逐个匹配当前 `etag`，命中即 304；该字段只要
+  存在就使 `If-Modified-Since` 被整体忽略（INM 格式错误为 400）。无 INM
+  时，仅当 IMS 与资源 Last-Modified 都是合法日期且资源时刻不晚于 IMS 才
+  304；IMS 日期非法视同未提供。304 不解析 Range、不产生体长度/分段，只
+  回显现有验证器头；未命中时 Range/If-Range 规则与 `/plan` 完全一致，无
+  Range 则规划完整 200。
 
 单区间 206 响应示例（节选）：
 
@@ -1009,7 +1156,8 @@ PORT=8080 docker compose up --build -d   # 或编辑 compose 中的 ports 映射
 ```
 src/
   conditional.js    # If-Range 评估：强 ETag 逐字比较、严格 HTTP-date 解析（IMF-fixdate/RFC 850/asctime）
-  planner.js        # 范围规划核心：解析、夹取、丢弃、合并、边界生成、422 守卫、条件降级
+  conditional-get.js # 条件 GET：If-None-Match 列表/* 解析与弱比较、If-Modified-Since 评估、304 规划
+  planner.js        # 范围规划核心：解析、夹取、丢弃、合并、边界生成、422 守卫、条件降级、完整 200 规划
   resume.js         # 断点续传缺口规划：区间归并、缺口计算、按 chunkBytes/limit 拆分
   multipart-check.js # multipart/byteranges 报文核验：boundary 解析、严格分段、Content-Range 核算、区间归并/差集
   assemble.js       # 稀疏缓存拼装：片段校验、重叠冲突检测、覆盖核算、单段/multipart 报文生成
@@ -1018,12 +1166,13 @@ src/
   shared-fetch.js   # 共享回源规划：多客户端需求全局归并去重、按上限拆块、带空隙阈值的自左向右合并、逐客户端覆盖核算
   cache-edit.js     # 编辑后缓存复用规划：编辑校验与排序、缓存去重、编辑边界分裂、净位移映射、旧/新双相邻合并、缺口补集（BigInt 求和）
   cache-diff.js     # 两份稀疏快照按字节定位差异：组内片段合并/冲突点名、边界切分叠加、equal/changed/unknown 分类与同类相邻合并（BigInt 计数）
-  app.js            # Fastify 应用：POST/GET /plan、POST /resume-plan、POST /multipart-check、POST /assemble-response、POST /cache-integrity-check、POST /cache-retention-plan、POST /shared-fetch-plan、POST /cache-edit-plan、POST /cache-snapshot-diff、/healthz、输入校验
+  app.js            # Fastify 应用：POST/GET /plan、POST/GET /get-plan、POST /resume-plan、POST /multipart-check、POST /assemble-response、POST /cache-integrity-check、POST /cache-retention-plan、POST /shared-fetch-plan、POST /cache-edit-plan、POST /cache-snapshot-diff、/healthz、输入校验
   server.js         # 启动入口与环境变量读取
 test/
   planner.test.js       # 原有 node:test 用例（26 个）
   if-range.test.js      # If-Range ETag/日期（含旧式日期格式）/降级/元数据校验用例（34 个）
-  headers.test.js       # 真实 socket 上的重复头与 CR/LF 拒绝用例（4 个）
+  conditional-get.test.js # 条件 GET 用例：INM 列表/*/弱比较/优先级、IMS 日期矩阵、304 短路、Range/If-Range 交互、400（48 个）
+  headers.test.js       # 真实 socket 上的重复头与 CR/LF 拒绝用例（8 个）
   resume.test.js        # 断点续传缺口规划用例（24 个）
   multipart-check.test.js # multipart/byteranges 核验用例（32 个）
   assemble.test.js      # 稀疏缓存拼装用例（31 个）
@@ -1038,7 +1187,7 @@ test/
 
 ```bash
 npm ci
-npm test          # 299 个用例：区间解析/合并/416/422/边界 + If-Range ETag/三种 HTTP-date/降级 + 重复头/CRLF + 续传缺口规划 + multipart 核验 + 稀疏缓存拼装 + 缓存完整性校验 + 缓存保留规划 + 共享回源规划 + 编辑后缓存复用规划 + 稀疏快照差异定位
+npm test          # 351 个用例：区间解析/合并/416/422/边界 + If-Range ETag/三种 HTTP-date/降级 + 条件 GET（If-None-Match 弱比较/列表/*/优先级、If-Modified-Since、304 短路、400）+ 重复头/CRLF + 续传缺口规划 + multipart 核验 + 稀疏缓存拼装 + 缓存完整性校验 + 缓存保留规划 + 共享回源规划 + 编辑后缓存复用规划 + 稀疏快照差异定位
 npm start
 ```
 
@@ -1054,6 +1203,14 @@ npm start
   `400 INVALID_ETAG` / `400 INVALID_LAST_MODIFIED`；GET 的重复同名参数也会被拒绝。
 - `If-Range` 中的非法验证器**不**算请求错误：按 RFC 忽略 Range 并返回
   200 完整规划（`condition.reason: "invalid-validator"`）。
+- `/get-plan` 的条件头与 `/plan` 同等防护：`If-None-Match`、
+  `If-Modified-Since` 均拒绝重复头（`400 DUPLICATE_IF_NONE_MATCH_HEADER` /
+  `DUPLICATE_IF_MODIFIED_SINCE_HEADER`）、超长（> 4096 字节）与 CR/LF；
+  格式错误的 **If-None-Match 是请求错误**（`400 MALFORMED_IF_NONE_MATCH`，
+  空列表项、`*` 与标签混用同样拒绝），而格式错误的 **If-Modified-Since
+  日期不是错误**——按 RFC 视同未提供该头继续处理；命中 304 时 Range 不
+  解析，但重复 Range 等结构性错误仍在 304 短路之前以 400 拒绝。304 规划
+  经 HTTP 200 + `X-Planned-Status: 304` 传输（RFC 禁止 304 携带消息体）。
 - `contentType` 需为合法媒体类型且不含 CR/LF，杜绝响应头注入。
 - 所有偏移量使用非负安全整数（`Number.MAX_SAFE_INTEGER` 以内）解析。
 - `/resume-plan` 使用独立的严格校验器：关闭类型强转与属性剔除，字符串数字、
